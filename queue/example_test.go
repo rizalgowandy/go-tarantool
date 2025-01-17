@@ -1,14 +1,24 @@
+// Setup queue module and start Tarantool instance before execution:
+// Terminal 1:
+// $ make deps
+// $ TEST_TNT_LISTEN=3013 tarantool queue/config.lua
+//
+// Terminal 2:
+// $ cd queue
+// $ go test -v example_test.go
 package queue_test
 
 import (
+	"context"
 	"fmt"
 	"time"
 
-	"github.com/tarantool/go-tarantool"
-	"github.com/tarantool/go-tarantool/queue"
+	"github.com/tarantool/go-tarantool/v2"
+	"github.com/tarantool/go-tarantool/v2/queue"
 )
 
-func ExampleConnection_Queue() {
+// Example demonstrates an operations like Put and Take with queue.
+func Example_simpleQueue() {
 	cfg := queue.Cfg{
 		Temporary: false,
 		Kind:      queue.FIFO,
@@ -16,8 +26,18 @@ func ExampleConnection_Queue() {
 			Ttl: 10 * time.Second,
 		},
 	}
+	opts := tarantool.Opts{
+		Timeout: 2500 * time.Millisecond,
+	}
+	dialer := tarantool.NetDialer{
+		Address:  "127.0.0.1:3013",
+		User:     "test",
+		Password: "test",
+	}
 
-	conn, err := tarantool.Connect(server, opts)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	conn, err := tarantool.Connect(ctx, dialer, opts)
 	if err != nil {
 		fmt.Printf("error in prepare is %v", err)
 		return
@@ -60,8 +80,13 @@ func ExampleConnection_Queue() {
 	}
 
 	task, err = q.TakeTimeout(2 * time.Second)
+	if err != nil {
+		fmt.Printf("error in take with timeout")
+	}
 	if task != nil {
 		fmt.Printf("Task should be nil, but %d", task.Id())
 		return
 	}
+
+	// Output: data_1:  test_data_1
 }

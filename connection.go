@@ -1,56 +1,81 @@
+// Package with implementation of methods and structures for work with
+// Tarantool instance.
 package tarantool
 
 import (
-	"bufio"
-	"bytes"
+	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"gopkg.in/vmihailenco/msgpack.v2"
+	"github.com/tarantool/go-iproto"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 const requestsMap = 128
+const ignoreStreamId = 0
 const (
 	connDisconnected = 0
 	connConnected    = 1
-	connClosed       = 2
+	connShutdown     = 2
+	connClosed       = 3
 )
+
+const shutdownEventKey = "box.shutdown"
 
 type ConnEventKind int
 type ConnLogKind int
 
+var (
+	errUnknownRequest = errors.New("the passed connected request doesn't belong " +
+		"to the current connection or connection pool")
+)
+
 const (
-	// Connect signals that connection is established or reestablished
+	// Connected signals that connection is established or reestablished.
 	Connected ConnEventKind = iota + 1
-	// Disconnect signals that connection is broken
+	// Disconnected signals that connection is broken.
 	Disconnected
-	// ReconnectFailed signals that attempt to reconnect has failed
+	// ReconnectFailed signals that attempt to reconnect has failed.
 	ReconnectFailed
-	// Either reconnect attempts exhausted, or explicit Close is called
+	// Shutdown signals that shutdown callback is processing.
+	Shutdown
+	// Either reconnect attempts exhausted, or explicit Close is called.
 	Closed
 
-	// LogReconnectFailed is logged when reconnect attempt failed
+	// LogReconnectFailed is logged when reconnect attempt failed.
 	LogReconnectFailed ConnLogKind = iota + 1
 	// LogLastReconnectFailed is logged when last reconnect attempt failed,
 	// connection will be closed after that.
 	LogLastReconnectFailed
-	// LogUnexpectedResultId is logged when response with unknown id were received.
+	// LogUnexpectedResultId is logged when response with unknown id was received.
 	// Most probably it is due to request timeout.
 	LogUnexpectedResultId
+	// LogWatchEventReadFailed is logged when failed to read a watch event.
+	LogWatchEventReadFailed
+	// LogAppendPushFailed is logged when failed to append a push response.
+	LogAppendPushFailed
 )
 
-// ConnEvent is sent throw Notify channel specified in Opts
+// ConnEvent is sent throw Notify channel specified in Opts.
 type ConnEvent struct {
 	Conn *Connection
 	Kind ConnEventKind
 	When time.Time
+}
+
+// A raw watch event.
+type connWatchEvent struct {
+	key   string
+	value interface{}
 }
 
 var epoch = time.Now()
@@ -67,60 +92,89 @@ func (d defaultLogger) Report(event ConnLogKind, conn *Connection, v ...interfac
 	case LogReconnectFailed:
 		reconnects := v[0].(uint)
 		err := v[1].(error)
-		log.Printf("tarantool: reconnect (%d/%d) to %s failed: %s\n", reconnects, conn.opts.MaxReconnects, conn.addr, err.Error())
+		log.Printf("tarantool: reconnect (%d/%d) to %s failed: %s",
+			reconnects, conn.opts.MaxReconnects, conn.Addr(), err)
 	case LogLastReconnectFailed:
 		err := v[0].(error)
-		log.Printf("tarantool: last reconnect to %s failed: %s, giving it up.\n", conn.addr, err.Error())
+		log.Printf("tarantool: last reconnect to %s failed: %s, giving it up",
+			conn.Addr(), err)
 	case LogUnexpectedResultId:
-		resp := v[0].(*Response)
-		log.Printf("tarantool: connection %s got unexpected resultId (%d) in response", conn.addr, resp.RequestId)
+		header := v[0].(Header)
+		log.Printf("tarantool: connection %s got unexpected request ID (%d) in response "+
+			"(probably cancelled request)",
+			conn.Addr(), header.RequestId)
+	case LogWatchEventReadFailed:
+		err := v[0].(error)
+		log.Printf("tarantool: unable to parse watch event: %s", err)
+	case LogAppendPushFailed:
+		err := v[0].(error)
+		log.Printf("tarantool: unable to append a push response: %s", err)
 	default:
 		args := append([]interface{}{"tarantool: unexpected event ", event, conn}, v...)
 		log.Print(args...)
 	}
 }
 
-// Connection is a handle to Tarantool.
+// Connection is a handle with a single connection to a Tarantool instance.
 //
 // It is created and configured with Connect function, and could not be
 // reconfigured later.
 //
-// It is could be "Connected", "Disconnected", and "Closed".
+// Connection could be in three possible states:
 //
-// When "Connected" it sends queries to Tarantool.
+// - In "Connected" state it sends queries to Tarantool.
 //
-// When "Disconnected" it rejects queries with ClientError{Code: ErrConnectionNotReady}
+// - In "Disconnected" state it rejects queries with ClientError{Code:
+// ErrConnectionNotReady}
 //
-// When "Closed" it rejects queries with ClientError{Code: ErrConnectionClosed}
+// - In "Shutdown" state it rejects queries with ClientError{Code:
+// ErrConnectionShutdown}. The state indicates that a graceful shutdown
+// in progress. The connection waits for all active requests to
+// complete.
 //
-// Connection could become "Closed" when Connection.Close() method called,
-// or when Tarantool disconnected and Reconnect pause is not specified or
-// MaxReconnects is specified and MaxReconnect reconnect attempts already performed.
+// - In "Closed" state it rejects queries with ClientError{Code:
+// ErrConnectionClosed}. Connection could become "Closed" when
+// Connection.Close() method called, or when Tarantool disconnected and
+// Reconnect pause is not specified or MaxReconnects is specified and
+// MaxReconnect reconnect attempts already performed.
 //
 // You may perform data manipulation operation by calling its methods:
 // Call*, Insert*, Replace*, Update*, Upsert*, Call*, Eval*.
 //
-// In any method that accepts `space` you my pass either space number or
-// space name (in this case it will be looked up in schema). Same is true for `index`.
+// In any method that accepts space you my pass either space number or space
+// name (in this case it will be looked up in schema). Same is true for index.
 //
-// ATTENTION: `tuple`, `key`, `ops` and `args` arguments for any method should be
+// ATTENTION: tuple, key, ops and args arguments for any method should be
 // and array or should serialize to msgpack array.
 //
-// ATTENTION: `result` argument for *Typed methods should deserialize from
+// ATTENTION: result argument for *Typed methods should deserialize from
 // msgpack array, cause Tarantool always returns result as an array.
-// For all space related methods and Call* (but not Call17*) methods Tarantool
+// For all space related methods and Call16* (but not Call17*) methods Tarantool
 // always returns array of array (array of tuples for space related methods).
-// For Eval* and Call17* tarantool always returns array, but does not forces
+// For Eval* and Call* Tarantool always returns array, but does not forces
 // array of arrays.
-
+//
+// If connected to Tarantool 2.10 or newer, connection supports server graceful
+// shutdown. In this case, server will wait until all client requests will be
+// finished and client disconnects before going down (server also may go down
+// by timeout). Client reconnect will happen if connection options enable
+// reconnect. Beware that graceful shutdown event initialization is asynchronous.
+//
+// More on graceful shutdown:
+// https://www.tarantool.io/en/doc/latest/dev_guide/internals/iproto/graceful_shutdown/
 type Connection struct {
-	addr  string
-	c     net.Conn
-	mutex sync.Mutex
-	// Schema contains schema loaded on connection.
-	Schema    *Schema
+	addr   net.Addr
+	dialer Dialer
+	c      Conn
+	mutex  sync.Mutex
+	cond   *sync.Cond
+	// schemaResolver contains a SchemaResolver implementation.
+	schemaResolver SchemaResolver
+	// requestId contains the last request ID for requests with nil context.
 	requestId uint32
-	// Greeting contains first message sent by tarantool
+	// contextRequestId contains the last request ID for requests with context.
+	contextRequestId uint32
+	// Greeting contains first message sent by Tarantool.
 	Greeting *Greeting
 
 	shard      []connShard
@@ -131,110 +185,147 @@ type Connection struct {
 	opts    Opts
 	state   uint32
 	dec     *msgpack.Decoder
-	lenbuf  [PacketLengthBytes]byte
+	lenbuf  [packetLengthBytes]byte
+
+	lastStreamId uint64
+
+	serverProtocolInfo ProtocolInfo
+	// watchMap is a map of key -> chan watchState.
+	watchMap sync.Map
+
+	// shutdownWatcher is the "box.shutdown" event watcher.
+	shutdownWatcher Watcher
+	// requestCnt is a counter of active requests.
+	requestCnt int64
 }
 
-var _ = Connector(&Connection{}) // check compatibility with connector interface
+var _ = Connector(&Connection{}) // Check compatibility with connector interface.
+
+type futureList struct {
+	first *Future
+	last  **Future
+}
+
+func (list *futureList) findFuture(reqid uint32, fetch bool) *Future {
+	root := &list.first
+	for {
+		fut := *root
+		if fut == nil {
+			return nil
+		}
+		if fut.requestId == reqid {
+			if fetch {
+				*root = fut.next
+				if fut.next == nil {
+					list.last = root
+				} else {
+					fut.next = nil
+				}
+			}
+			return fut
+		}
+		root = &fut.next
+	}
+}
+
+func (list *futureList) addFuture(fut *Future) {
+	*list.last = fut
+	list.last = &fut.next
+}
+
+func (list *futureList) clear(err error, conn *Connection) {
+	fut := list.first
+	list.first = nil
+	list.last = &list.first
+	for fut != nil {
+		fut.SetError(err)
+		conn.markDone(fut)
+		fut, fut.next = fut.next, nil
+	}
+}
 
 type connShard struct {
-	rmut     sync.Mutex
-	requests [requestsMap]struct {
-		first *Future
-		last  **Future
-	}
-	bufmut sync.Mutex
-	buf    smallWBuf
-	enc    *msgpack.Encoder
-	_pad   [16]uint64
+	rmut            sync.Mutex
+	requests        [requestsMap]futureList
+	requestsWithCtx [requestsMap]futureList
+	bufmut          sync.Mutex
+	buf             smallWBuf
+	enc             *msgpack.Encoder
 }
 
-// Greeting is a message sent by tarantool on connect.
-type Greeting struct {
-	Version string
-	auth    string
-}
+// RLimitActions is an enumeration type for an action to do when a rate limit
+// is reached.
+type RLimitAction int
+
+const (
+	// RLimitDrop immediately aborts the request.
+	RLimitDrop RLimitAction = iota
+	// RLimitWait waits during timeout period for some request to be answered.
+	// If no request answered during timeout period, this request is aborted.
+	// If no timeout period is set, it will wait forever.
+	RLimitWait
+)
 
 // Opts is a way to configure Connection
 type Opts struct {
-	// Timeout is requests timeout.
-	// Also used to setup net.TCPConn.Set(Read|Write)Deadline
+	// Timeout for response to a particular request. The timeout is reset when
+	// push messages are received. If Timeout is zero, any request can be
+	// blocked infinitely.
+	// Also used to setup net.TCPConn.Set(Read|Write)Deadline.
+	//
+	// Pay attention, when using contexts with request objects,
+	// the timeout option for Connection does not affect the lifetime
+	// of the request. For those purposes use context.WithTimeout() as
+	// the root context.
 	Timeout time.Duration
-	// Reconnect is a pause between reconnection attempts.
-	// If specified, then when tarantool is not reachable or disconnected,
+	// Timeout between reconnect attempts. If Reconnect is zero, no
+	// reconnect attempts will be made.
+	// If specified, then when Tarantool is not reachable or disconnected,
 	// new connect attempt is performed after pause.
 	// By default, no reconnection attempts are performed,
 	// so once disconnected, connection becomes Closed.
 	Reconnect time.Duration
-	// MaxReconnects is a maximum reconnect attempts.
+	// Maximum number of reconnect failures; after that we give it up to
+	// on. If MaxReconnects is zero, the client will try to reconnect
+	// endlessly.
 	// After MaxReconnects attempts Connection becomes closed.
 	MaxReconnects uint
-	// User name for authorization
-	User string
-	// Pass is password for authorization
-	Pass string
-	// RateLimit limits number of 'in-fly' request, ie already put into
+	// RateLimit limits number of 'in-fly' request, i.e. already put into
 	// requests queue, but not yet answered by server or timeouted.
 	// It is disabled by default.
 	// See RLimitAction for possible actions when RateLimit.reached.
 	RateLimit uint
-	// RLimitAction tells what to do when RateLimit reached:
-	//   RLimitDrop - immediatly abort request,
-	//   RLimitWait - wait during timeout period for some request to be answered.
-	//                If no request answered during timeout period, this request
-	//                is aborted.
-	//                If no timeout period is set, it will wait forever.
+	// RLimitAction tells what to do when RateLimit is reached.
 	// It is required if RateLimit is specified.
-	RLimitAction uint
+	RLimitAction RLimitAction
 	// Concurrency is amount of separate mutexes for request
 	// queues and buffers inside of connection.
-	// It is rounded upto nearest power of 2.
+	// It is rounded up to nearest power of 2.
 	// By default it is runtime.GOMAXPROCS(-1) * 4
 	Concurrency uint32
 	// SkipSchema disables schema loading. Without disabling schema loading,
-	// there is no way to create Connection for currently not accessible tarantool.
+	// there is no way to create Connection for currently not accessible Tarantool.
 	SkipSchema bool
 	// Notify is a channel which receives notifications about Connection status
 	// changes.
 	Notify chan<- ConnEvent
-	// Handle is user specified value, that could be retrivied with Handle() method
+	// Handle is user specified value, that could be retrivied with
+	// Handle() method.
 	Handle interface{}
-	// Logger is user specified logger used for error messages
+	// Logger is user specified logger used for error messages.
 	Logger Logger
 }
 
-// Connect creates and configures new Connection
-//
-// Address could be specified in following ways:
-//
-// TCP connections:
-// - tcp://192.168.1.1:3013
-// - tcp://my.host:3013
-// - tcp:192.168.1.1:3013
-// - tcp:my.host:3013
-// - 192.168.1.1:3013
-// - my.host:3013
-// Unix socket:
-// - unix:///abs/path/tnt.sock
-// - unix:path/tnt.sock
-// - /abs/path/tnt.sock  - first '/' indicates unix socket
-// - ./rel/path/tnt.sock - first '.' indicates unix socket
-// - unix/:path/tnt.sock  - 'unix/' acts as a "host" and "/path..." as a port
-//
-// Note:
-//
-// - If opts.Reconnect is zero (default), then connection either already connected
-// or error is returned.
-//
-// - If opts.Reconnect is non-zero, then error will be returned only if authorization// fails. But if Tarantool is not reachable, then it will attempt to reconnect later
-// and will not end attempts on authorization failures.
-func Connect(addr string, opts Opts) (conn *Connection, err error) {
+// Connect creates and configures a new Connection.
+func Connect(ctx context.Context, dialer Dialer, opts Opts) (conn *Connection, err error) {
 	conn = &Connection{
-		addr:      addr,
-		requestId: 0,
-		Greeting:  &Greeting{},
-		control:   make(chan struct{}),
-		opts:      opts,
-		dec:       msgpack.NewDecoder(&smallBuf{}),
+		dialer:           dialer,
+		requestId:        0,
+		contextRequestId: 1,
+		Greeting:         &Greeting{},
+		control:          make(chan struct{}),
+		opts:             opts,
+		dec:              msgpack.NewDecoder(&smallBuf{}),
 	}
 	maxprocs := uint32(runtime.GOMAXPROCS(-1))
 	if conn.opts.Concurrency == 0 || conn.opts.Concurrency > maxprocs*128 {
@@ -250,14 +341,17 @@ func Connect(addr string, opts Opts) (conn *Connection, err error) {
 	conn.shard = make([]connShard, conn.opts.Concurrency)
 	for i := range conn.shard {
 		shard := &conn.shard[i]
-		for j := range shard.requests {
-			shard.requests[j].last = &shard.requests[j].first
+		requestsLists := []*[requestsMap]futureList{&shard.requests, &shard.requestsWithCtx}
+		for _, requests := range requestsLists {
+			for j := range requests {
+				requests[j].last = &requests[j].first
+			}
 		}
 	}
 
-	if opts.RateLimit > 0 {
-		conn.rlimit = make(chan struct{}, opts.RateLimit)
-		if opts.RLimitAction != RLimitDrop && opts.RLimitAction != RLimitWait {
+	if conn.opts.RateLimit > 0 {
+		conn.rlimit = make(chan struct{}, conn.opts.RateLimit)
+		if conn.opts.RLimitAction != RLimitDrop && conn.opts.RLimitAction != RLimitWait {
 			return nil, errors.New("RLimitAction should be specified to RLimitDone nor RLimitWait")
 		}
 	}
@@ -266,25 +360,10 @@ func Connect(addr string, opts Opts) (conn *Connection, err error) {
 		conn.opts.Logger = defaultLogger{}
 	}
 
-	if err = conn.createConnection(false); err != nil {
-		ter, ok := err.(Error)
-		if conn.opts.Reconnect <= 0 {
-			return nil, err
-		} else if ok && (ter.Code == ErrNoSuchUser ||
-			ter.Code == ErrPasswordMismatch) {
-			/* reported auth errors immediatly */
-			return nil, err
-		} else {
-			// without SkipSchema it is useless
-			go func(conn *Connection) {
-				conn.mutex.Lock()
-				defer conn.mutex.Unlock()
-				if err := conn.createConnection(true); err != nil {
-					conn.closeConnection(err, true)
-				}
-			}(conn)
-			err = nil
-		}
+	conn.cond = sync.NewCond(&conn.mutex)
+
+	if err = conn.createConnection(ctx); err != nil {
+		return nil, err
 	}
 
 	go conn.pinger()
@@ -292,14 +371,16 @@ func Connect(addr string, opts Opts) (conn *Connection, err error) {
 		go conn.timeouts()
 	}
 
-	// TODO: reload schema after reconnect
+	// TODO: reload schema after reconnect.
 	if !conn.opts.SkipSchema {
-		if err = conn.loadSchema(); err != nil {
+		schema, err := GetSchema(conn)
+		if err != nil {
 			conn.mutex.Lock()
 			defer conn.mutex.Unlock()
 			conn.closeConnection(err, true)
 			return nil, err
 		}
+		conn.SetSchema(schema)
 	}
 
 	return conn, err
@@ -324,183 +405,166 @@ func (conn *Connection) Close() error {
 	return conn.closeConnection(err, true)
 }
 
-// Addr is configured address of Tarantool socket
-func (conn *Connection) Addr() string {
+// CloseGraceful closes Connection gracefully. It waits for all requests to
+// complete.
+// After this method called, there is no way to reopen this Connection.
+func (conn *Connection) CloseGraceful() error {
+	return conn.shutdown(true)
+}
+
+// Addr returns a configured address of Tarantool socket.
+func (conn *Connection) Addr() net.Addr {
 	return conn.addr
 }
 
-// RemoteAddr is address of Tarantool socket
-func (conn *Connection) RemoteAddr() string {
-	conn.mutex.Lock()
-	defer conn.mutex.Unlock()
-	if conn.c == nil {
-		return ""
-	}
-	return conn.c.RemoteAddr().String()
-}
-
-// LocalAddr is address of outgoing socket
-func (conn *Connection) LocalAddr() string {
-	conn.mutex.Lock()
-	defer conn.mutex.Unlock()
-	if conn.c == nil {
-		return ""
-	}
-	return conn.c.LocalAddr().String()
-}
-
-// Handle returns user specified handle from Opts
+// Handle returns a user-specified handle from Opts.
 func (conn *Connection) Handle() interface{} {
 	return conn.opts.Handle
 }
 
-func (conn *Connection) dial() (err error) {
-	var connection net.Conn
-	network := "tcp"
-	address := conn.addr
-	timeout := conn.opts.Reconnect / 2
-	if timeout == 0 {
-		timeout = 500 * time.Millisecond
-	} else if timeout > 5*time.Second {
-		timeout = 5 * time.Second
+func (conn *Connection) cancelFuture(fut *Future, err error) {
+	if fut = conn.fetchFuture(fut.requestId); fut != nil {
+		fut.SetError(err)
+		conn.markDone(fut)
 	}
-	// Unix socket connection
-	addrLen := len(address)
-	if addrLen > 0 && (address[0] == '.' || address[0] == '/') {
-		network = "unix"
-	} else if addrLen >= 7 && address[0:7] == "unix://" {
-		network = "unix"
-		address = address[7:]
-	} else if addrLen >= 5 && address[0:5] == "unix:" {
-		network = "unix"
-		address = address[5:]
-	} else if addrLen >= 6 && address[0:6] == "unix/:" {
-		network = "unix"
-		address = address[6:]
-	} else if addrLen >= 6 && address[0:6] == "tcp://" {
-		address = address[6:]
-	} else if addrLen >= 4 && address[0:4] == "tcp:" {
-		address = address[4:]
-	}
-	connection, err = net.DialTimeout(network, address, timeout)
-	if err != nil {
-		return
-	}
-	dc := &DeadlineIO{to: conn.opts.Timeout, c: connection}
-	r := bufio.NewReaderSize(dc, 128*1024)
-	w := bufio.NewWriterSize(dc, 128*1024)
-	greeting := make([]byte, 128)
-	_, err = io.ReadFull(r, greeting)
-	if err != nil {
-		connection.Close()
-		return
-	}
-	conn.Greeting.Version = bytes.NewBuffer(greeting[:64]).String()
-	conn.Greeting.auth = bytes.NewBuffer(greeting[64:108]).String()
-
-	// Auth
-	if conn.opts.User != "" {
-		scr, err := scramble(conn.Greeting.auth, conn.opts.Pass)
-		if err != nil {
-			err = errors.New("auth: scrambling failure " + err.Error())
-			connection.Close()
-			return err
-		}
-		if err = conn.writeAuthRequest(w, scr); err != nil {
-			connection.Close()
-			return err
-		}
-		if err = conn.readAuthResponse(r); err != nil {
-			connection.Close()
-			return err
-		}
-	}
-
-	// Only if connected and authenticated
-	conn.lockShards()
-	conn.c = connection
-	atomic.StoreUint32(&conn.state, connConnected)
-	conn.unlockShards()
-	go conn.writer(w, connection)
-	go conn.reader(r, connection)
-
-	return
 }
 
-func (conn *Connection) writeAuthRequest(w *bufio.Writer, scramble []byte) (err error) {
-	request := &Future{
-		requestId:   0,
-		requestCode: AuthRequest,
-	}
-	var packet smallWBuf
-	err = request.pack(&packet, msgpack.NewEncoder(&packet), func(enc *msgpack.Encoder) error {
-		return enc.Encode(map[uint32]interface{}{
-			KeyUserName: conn.opts.User,
-			KeyTuple:    []interface{}{string("chap-sha1"), string(scramble)},
-		})
+func (conn *Connection) dial(ctx context.Context) error {
+	opts := conn.opts
+
+	var c Conn
+	c, err := conn.dialer.Dial(ctx, DialOpts{
+		IoTimeout: opts.Timeout,
 	})
 	if err != nil {
-		return errors.New("auth: pack error " + err.Error())
+		return err
 	}
-	if err := write(w, packet.b); err != nil {
-		return errors.New("auth: write error " + err.Error())
+
+	conn.addr = c.Addr()
+	connGreeting := c.Greeting()
+	conn.Greeting.Version = connGreeting.Version
+	conn.Greeting.Salt = connGreeting.Salt
+	conn.serverProtocolInfo = c.ProtocolInfo()
+
+	if conn.schemaResolver == nil {
+		namesSupported := isFeatureInSlice(iproto.IPROTO_FEATURE_SPACE_AND_INDEX_NAMES,
+			conn.serverProtocolInfo.Features)
+
+		conn.schemaResolver = &noSchemaResolver{
+			SpaceAndIndexNamesSupported: namesSupported,
+		}
 	}
-	if err = w.Flush(); err != nil {
-		return errors.New("auth: flush error " + err.Error())
+
+	// Watchers.
+	conn.watchMap.Range(func(key, value interface{}) bool {
+		st := value.(chan watchState)
+		state := <-st
+		if state.unready != nil {
+			st <- state
+			return true
+		}
+
+		req := newWatchRequest(key.(string))
+		if err = writeRequest(c, req); err != nil {
+			st <- state
+			return false
+		}
+		state.ack = true
+
+		st <- state
+		return true
+	})
+
+	if err != nil {
+		c.Close()
+		return fmt.Errorf("unable to register watch: %w", err)
 	}
+
+	// Only if connected and fully initialized.
+	conn.lockShards()
+	conn.c = c
+	atomic.StoreUint32(&conn.state, connConnected)
+	conn.cond.Broadcast()
+	conn.unlockShards()
+	go conn.writer(c, c)
+	go conn.reader(c, c)
+
+	// Subscribe shutdown event to process graceful shutdown.
+	if conn.shutdownWatcher == nil &&
+		isFeatureInSlice(iproto.IPROTO_FEATURE_WATCHERS,
+			conn.serverProtocolInfo.Features) {
+		watcher, werr := conn.newWatcherImpl(shutdownEventKey, shutdownEventCallback)
+		if werr != nil {
+			return werr
+		}
+		conn.shutdownWatcher = watcher
+	}
+
+	return nil
+}
+
+func pack(h *smallWBuf, enc *msgpack.Encoder, reqid uint32,
+	req Request, streamId uint64, res SchemaResolver) (err error) {
+	const uint32Code = 0xce
+	const uint64Code = 0xcf
+	const streamBytesLenUint64 = 10
+	const streamBytesLenUint32 = 6
+
+	hl := h.Len()
+
+	var streamBytesLen = 0
+	var streamBytes [streamBytesLenUint64]byte
+	hMapLen := byte(0x82) // 2 element map.
+	if streamId != ignoreStreamId {
+		hMapLen = byte(0x83) // 3 element map.
+		streamBytes[0] = byte(iproto.IPROTO_STREAM_ID)
+		if streamId > math.MaxUint32 {
+			streamBytesLen = streamBytesLenUint64
+			streamBytes[1] = uint64Code
+			binary.BigEndian.PutUint64(streamBytes[2:], streamId)
+		} else {
+			streamBytesLen = streamBytesLenUint32
+			streamBytes[1] = uint32Code
+			binary.BigEndian.PutUint32(streamBytes[2:], uint32(streamId))
+		}
+	}
+
+	hBytes := append([]byte{
+		uint32Code, 0, 0, 0, 0, // Length.
+		hMapLen,
+		byte(iproto.IPROTO_REQUEST_TYPE), byte(req.Type()), // Request type.
+		byte(iproto.IPROTO_SYNC), uint32Code,
+		byte(reqid >> 24), byte(reqid >> 16),
+		byte(reqid >> 8), byte(reqid),
+	}, streamBytes[:streamBytesLen]...)
+
+	h.Write(hBytes)
+
+	if err = req.Body(res, enc); err != nil {
+		return
+	}
+
+	l := uint32(h.Len() - 5 - hl)
+	h.b[hl+1] = byte(l >> 24)
+	h.b[hl+2] = byte(l >> 16)
+	h.b[hl+3] = byte(l >> 8)
+	h.b[hl+4] = byte(l)
+
 	return
 }
 
-func (conn *Connection) readAuthResponse(r io.Reader) (err error) {
-	respBytes, err := conn.read(r)
-	if err != nil {
-		return errors.New("auth: read error " + err.Error())
-	}
-	resp := Response{buf: smallBuf{b: respBytes}}
-	err = resp.decodeHeader(conn.dec)
-	if err != nil {
-		return errors.New("auth: decode response header error " + err.Error())
-	}
-	err = resp.decodeBody()
-	if err != nil {
-		switch err.(type) {
-		case Error:
-			return err
-		default:
-			return errors.New("auth: decode response body error " + err.Error())
+func (conn *Connection) createConnection(ctx context.Context) error {
+	var err error
+	if conn.c == nil && conn.state == connDisconnected {
+		if err = conn.dial(ctx); err == nil {
+			conn.notify(Connected)
+			return nil
 		}
-	}
-	return
-}
-
-func (conn *Connection) createConnection(reconnect bool) (err error) {
-	var reconnects uint
-	for conn.c == nil && conn.state == connDisconnected {
-		now := time.Now()
-		err = conn.dial()
-		if err == nil || !reconnect {
-			if err == nil {
-				conn.notify(Connected)
-			}
-			return
-		}
-		if conn.opts.MaxReconnects > 0 && reconnects > conn.opts.MaxReconnects {
-			conn.opts.Logger.Report(LogLastReconnectFailed, conn, err)
-			err = ClientError{ErrConnectionClosed, "last reconnect failed"}
-			// mark connection as closed to avoid reopening by another goroutine
-			return
-		}
-		conn.opts.Logger.Report(LogReconnectFailed, conn, reconnects, err)
-		conn.notify(ReconnectFailed)
-		reconnects++
-		conn.mutex.Unlock()
-		time.Sleep(now.Add(conn.opts.Reconnect).Sub(time.Now()))
-		conn.mutex.Lock()
 	}
 	if conn.state == connClosed {
 		err = ClientError{ErrConnectionClosed, "using closed connection"}
 	}
-	return
+	return err
 }
 
 func (conn *Connection) closeConnection(neterr error, forever bool) (err error) {
@@ -510,10 +574,17 @@ func (conn *Connection) closeConnection(neterr error, forever bool) (err error) 
 		if conn.state != connClosed {
 			close(conn.control)
 			atomic.StoreUint32(&conn.state, connClosed)
+			conn.cond.Broadcast()
+			// Free the resources.
+			if conn.shutdownWatcher != nil {
+				go conn.shutdownWatcher.Unregister()
+				conn.shutdownWatcher = nil
+			}
 			conn.notify(Closed)
 		}
 	} else {
 		atomic.StoreUint32(&conn.state, connDisconnected)
+		conn.cond.Broadcast()
 		conn.notify(Disconnected)
 	}
 	if conn.c != nil {
@@ -522,34 +593,83 @@ func (conn *Connection) closeConnection(neterr error, forever bool) (err error) 
 	}
 	for i := range conn.shard {
 		conn.shard[i].buf.Reset()
-		requests := &conn.shard[i].requests
-		for pos := range requests {
-			fut := requests[pos].first
-			requests[pos].first = nil
-			requests[pos].last = &requests[pos].first
-			for fut != nil {
-				fut.err = neterr
-				fut.markReady(conn)
-				fut, fut.next = fut.next, nil
+		requestsLists := []*[requestsMap]futureList{
+			&conn.shard[i].requests,
+			&conn.shard[i].requestsWithCtx,
+		}
+		for _, requests := range requestsLists {
+			for pos := range requests {
+				requests[pos].clear(neterr, conn)
 			}
 		}
 	}
 	return
 }
 
-func (conn *Connection) reconnect(neterr error, c net.Conn) {
-	conn.mutex.Lock()
-	defer conn.mutex.Unlock()
+func (conn *Connection) getDialTimeout() time.Duration {
+	dialTimeout := conn.opts.Reconnect / 2
+	if dialTimeout == 0 {
+		dialTimeout = 500 * time.Millisecond
+	} else if dialTimeout > 5*time.Second {
+		dialTimeout = 5 * time.Second
+	}
+	return dialTimeout
+}
+
+func (conn *Connection) runReconnects() error {
+	dialTimeout := conn.getDialTimeout()
+	var reconnects uint
+	var err error
+
+	for conn.opts.MaxReconnects == 0 || reconnects <= conn.opts.MaxReconnects {
+		now := time.Now()
+
+		ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+		err = conn.createConnection(ctx)
+		cancel()
+
+		if err != nil {
+			if clientErr, ok := err.(ClientError); ok &&
+				clientErr.Code == ErrConnectionClosed {
+				return err
+			}
+		} else {
+			return nil
+		}
+
+		conn.opts.Logger.Report(LogReconnectFailed, conn, reconnects, err)
+		conn.notify(ReconnectFailed)
+		reconnects++
+		conn.mutex.Unlock()
+
+		time.Sleep(time.Until(now.Add(conn.opts.Reconnect)))
+
+		conn.mutex.Lock()
+	}
+
+	conn.opts.Logger.Report(LogLastReconnectFailed, conn, err)
+	// mark connection as closed to avoid reopening by another goroutine
+	return ClientError{ErrConnectionClosed, "last reconnect failed"}
+}
+
+func (conn *Connection) reconnectImpl(neterr error, c Conn) {
 	if conn.opts.Reconnect > 0 {
 		if c == conn.c {
 			conn.closeConnection(neterr, false)
-			if err := conn.createConnection(true); err != nil {
+			if err := conn.runReconnects(); err != nil {
 				conn.closeConnection(err, true)
 			}
 		}
 	} else {
 		conn.closeConnection(neterr, true)
 	}
+}
+
+func (conn *Connection) reconnect(neterr error, c Conn) {
+	conn.mutex.Lock()
+	defer conn.mutex.Unlock()
+	conn.reconnectImpl(neterr, c)
+	conn.cond.Broadcast()
 }
 
 func (conn *Connection) lockShards() {
@@ -592,7 +712,7 @@ func (conn *Connection) notify(kind ConnEventKind) {
 	}
 }
 
-func (conn *Connection) writer(w *bufio.Writer, c net.Conn) {
+func (conn *Connection) writer(w writeFlusher, c Conn) {
 	var shardn uint32
 	var packet smallWBuf
 	for atomic.LoadUint32(&conn.state) != connClosed {
@@ -602,6 +722,10 @@ func (conn *Connection) writer(w *bufio.Writer, c net.Conn) {
 			runtime.Gosched()
 			if len(conn.dirtyShard) == 0 {
 				if err := w.Flush(); err != nil {
+					err = ClientError{
+						ErrIoError,
+						fmt.Sprintf("failed to flush data to the connection: %s", err),
+					}
 					conn.reconnect(err, c)
 					return
 				}
@@ -624,7 +748,11 @@ func (conn *Connection) writer(w *bufio.Writer, c net.Conn) {
 		if packet.Len() == 0 {
 			continue
 		}
-		if err := write(w, packet.b); err != nil {
+		if _, err := w.Write(packet.b); err != nil {
+			err = ClientError{
+				ErrIoError,
+				fmt.Sprintf("failed to write data to the connection: %s", err),
+			}
 			conn.reconnect(err, c)
 			return
 		}
@@ -632,62 +760,199 @@ func (conn *Connection) writer(w *bufio.Writer, c net.Conn) {
 	}
 }
 
-func (conn *Connection) reader(r *bufio.Reader, c net.Conn) {
+func readWatchEvent(reader io.Reader) (connWatchEvent, error) {
+	keyExist := false
+	event := connWatchEvent{}
+	d := msgpack.NewDecoder(reader)
+
+	l, err := d.DecodeMapLen()
+	if err != nil {
+		return event, err
+	}
+
+	for ; l > 0; l-- {
+		cd, err := d.DecodeInt()
+		if err != nil {
+			return event, err
+		}
+
+		switch iproto.Key(cd) {
+		case iproto.IPROTO_EVENT_KEY:
+			if event.key, err = d.DecodeString(); err != nil {
+				return event, err
+			}
+			keyExist = true
+		case iproto.IPROTO_EVENT_DATA:
+			if event.value, err = d.DecodeInterface(); err != nil {
+				return event, err
+			}
+		default:
+			if err = d.Skip(); err != nil {
+				return event, err
+			}
+		}
+	}
+
+	if !keyExist {
+		return event, errors.New("watch event does not have a key")
+	}
+
+	return event, nil
+}
+
+func (conn *Connection) reader(r io.Reader, c Conn) {
+	events := make(chan connWatchEvent, 1024)
+	defer close(events)
+
+	go conn.eventer(events)
+
 	for atomic.LoadUint32(&conn.state) != connClosed {
-		respBytes, err := conn.read(r)
+		respBytes, err := read(r, conn.lenbuf[:])
 		if err != nil {
+			err = ClientError{
+				ErrIoError,
+				fmt.Sprintf("failed to read data from the connection: %s", err),
+			}
 			conn.reconnect(err, c)
 			return
 		}
-		resp := &Response{buf: smallBuf{b: respBytes}}
-		err = resp.decodeHeader(conn.dec)
+		buf := smallBuf{b: respBytes}
+		header, code, err := decodeHeader(conn.dec, &buf)
 		if err != nil {
+			err = ClientError{
+				ErrProtocolError,
+				fmt.Sprintf("failed to decode IPROTO header: %s", err),
+			}
 			conn.reconnect(err, c)
 			return
 		}
-		if fut := conn.fetchFuture(resp.RequestId); fut != nil {
-			fut.resp = resp
-			fut.markReady(conn)
+
+		var fut *Future = nil
+		if code == iproto.IPROTO_EVENT {
+			if event, err := readWatchEvent(&buf); err == nil {
+				events <- event
+			} else {
+				err = ClientError{
+					ErrProtocolError,
+					fmt.Sprintf("failed to decode IPROTO_EVENT: %s", err),
+				}
+				conn.opts.Logger.Report(LogWatchEventReadFailed, conn, err)
+			}
+			continue
+		} else if code == iproto.IPROTO_CHUNK {
+			if fut = conn.peekFuture(header.RequestId); fut != nil {
+				if err := fut.AppendPush(header, &buf); err != nil {
+					err = ClientError{
+						ErrProtocolError,
+						fmt.Sprintf("failed to append push response: %s", err),
+					}
+					conn.opts.Logger.Report(LogAppendPushFailed, conn, err)
+				}
+			}
 		} else {
-			conn.opts.Logger.Report(LogUnexpectedResultId, conn, resp)
+			if fut = conn.fetchFuture(header.RequestId); fut != nil {
+				if err := fut.SetResponse(header, &buf); err != nil {
+					fut.SetError(fmt.Errorf("failed to set response: %w", err))
+				}
+				conn.markDone(fut)
+			}
+		}
+
+		if fut == nil {
+			conn.opts.Logger.Report(LogUnexpectedResultId, conn, header)
 		}
 	}
 }
 
-func (conn *Connection) newFuture(requestCode int32) (fut *Future) {
-	fut = &Future{}
+// eventer goroutine gets watch events and updates values for watchers.
+func (conn *Connection) eventer(events <-chan connWatchEvent) {
+	for event := range events {
+		if value, ok := conn.watchMap.Load(event.key); ok {
+			st := value.(chan watchState)
+			state := <-st
+			state.value = event.value
+			if state.version == math.MaxUint {
+				state.version = initWatchEventVersion + 1
+			} else {
+				state.version += 1
+			}
+			state.ack = false
+			if state.changed != nil {
+				close(state.changed)
+				state.changed = nil
+			}
+			st <- state
+		}
+		// It is possible to get IPROTO_EVENT after we already send
+		// IPROTO_UNWATCH due to processing on a Tarantool side or slow
+		// read from the network, so it looks like an expected behavior.
+	}
+}
+
+func (conn *Connection) newFuture(req Request) (fut *Future) {
+	ctx := req.Ctx()
+	fut = NewFuture(req)
 	if conn.rlimit != nil && conn.opts.RLimitAction == RLimitDrop {
 		select {
 		case conn.rlimit <- struct{}{}:
 		default:
-			fut.err = ClientError{ErrRateLimited, "Request is rate limited on client"}
+			fut.err = ClientError{
+				ErrRateLimited,
+				"Request is rate limited on client",
+			}
+			fut.ready = nil
+			fut.done = nil
 			return
 		}
 	}
-	fut.ready = make(chan struct{})
-	fut.requestId = conn.nextRequestId()
-	fut.requestCode = requestCode
+	fut.requestId = conn.nextRequestId(ctx != nil)
 	shardn := fut.requestId & (conn.opts.Concurrency - 1)
 	shard := &conn.shard[shardn]
 	shard.rmut.Lock()
-	switch conn.state {
+	switch atomic.LoadUint32(&conn.state) {
 	case connClosed:
-		fut.err = ClientError{ErrConnectionClosed, "using closed connection"}
+		fut.err = ClientError{
+			ErrConnectionClosed,
+			"using closed connection",
+		}
 		fut.ready = nil
+		fut.done = nil
 		shard.rmut.Unlock()
 		return
 	case connDisconnected:
-		fut.err = ClientError{ErrConnectionNotReady, "client connection is not ready"}
+		fut.err = ClientError{
+			ErrConnectionNotReady,
+			"client connection is not ready",
+		}
 		fut.ready = nil
+		fut.done = nil
+		shard.rmut.Unlock()
+		return
+	case connShutdown:
+		fut.err = ClientError{
+			ErrConnectionShutdown,
+			"server shutdown in progress",
+		}
+		fut.ready = nil
+		fut.done = nil
 		shard.rmut.Unlock()
 		return
 	}
 	pos := (fut.requestId / conn.opts.Concurrency) & (requestsMap - 1)
-	pair := &shard.requests[pos]
-	*pair.last = fut
-	pair.last = &fut.next
-	if conn.opts.Timeout > 0 {
-		fut.timeout = time.Now().Sub(epoch) + conn.opts.Timeout
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			fut.SetError(fmt.Errorf("context is done (request ID %d)", fut.requestId))
+			shard.rmut.Unlock()
+			return
+		default:
+		}
+		shard.requestsWithCtx[pos].addFuture(fut)
+	} else {
+		shard.requests[pos].addFuture(fut)
+		if conn.opts.Timeout > 0 {
+			fut.timeout = time.Since(epoch) + conn.opts.Timeout
+		}
 	}
 	shard.rmut.Unlock()
 	if conn.rlimit != nil && conn.opts.RLimitAction == RLimitWait {
@@ -697,9 +962,9 @@ func (conn *Connection) newFuture(requestCode int32) (fut *Future) {
 			runtime.Gosched()
 			select {
 			case conn.rlimit <- struct{}{}:
-			case <-fut.ready:
+			case <-fut.done:
 				if fut.err == nil {
-					panic("fut.ready is closed, but err is nil")
+					panic("fut.done is closed, but err is nil")
 				}
 			}
 		}
@@ -707,12 +972,61 @@ func (conn *Connection) newFuture(requestCode int32) (fut *Future) {
 	return
 }
 
-func (conn *Connection) putFuture(fut *Future, body func(*msgpack.Encoder) error) {
+// This method removes a future from the internal queue if the context
+// is "done" before the response is come.
+func (conn *Connection) contextWatchdog(fut *Future, ctx context.Context) {
+	select {
+	case <-fut.done:
+	case <-ctx.Done():
+	}
+
+	select {
+	case <-fut.done:
+		return
+	default:
+		conn.cancelFuture(fut, fmt.Errorf("context is done (request ID %d)", fut.requestId))
+	}
+}
+
+func (conn *Connection) incrementRequestCnt() {
+	atomic.AddInt64(&conn.requestCnt, int64(1))
+}
+
+func (conn *Connection) decrementRequestCnt() {
+	if atomic.AddInt64(&conn.requestCnt, int64(-1)) == 0 {
+		conn.cond.Broadcast()
+	}
+}
+
+func (conn *Connection) send(req Request, streamId uint64) *Future {
+	conn.incrementRequestCnt()
+
+	fut := conn.newFuture(req)
+	if fut.ready == nil {
+		conn.decrementRequestCnt()
+		return fut
+	}
+
+	if req.Ctx() != nil {
+		select {
+		case <-req.Ctx().Done():
+			conn.cancelFuture(fut, fmt.Errorf("context is done (request ID %d)", fut.requestId))
+			return fut
+		default:
+		}
+		go conn.contextWatchdog(fut, req.Ctx())
+	}
+	conn.putFuture(fut, req, streamId)
+
+	return fut
+}
+
+func (conn *Connection) putFuture(fut *Future, req Request, streamId uint64) {
 	shardn := fut.requestId & (conn.opts.Concurrency - 1)
 	shard := &conn.shard[shardn]
 	shard.bufmut.Lock()
 	select {
-	case <-fut.ready:
+	case <-fut.done:
 		shard.bufmut.Unlock()
 		return
 	default:
@@ -723,12 +1037,13 @@ func (conn *Connection) putFuture(fut *Future, body func(*msgpack.Encoder) error
 		shard.enc = msgpack.NewEncoder(&shard.buf)
 	}
 	blen := shard.buf.Len()
-	if err := fut.pack(&shard.buf, shard.enc, body); err != nil {
+	reqid := fut.requestId
+	if err := pack(&shard.buf, shard.enc, reqid, req, streamId, conn.schemaResolver); err != nil {
 		shard.buf.Trunc(blen)
 		shard.bufmut.Unlock()
-		if f := conn.fetchFuture(fut.requestId); f == fut {
-			fut.markReady(conn)
-			fut.err = err
+		if f := conn.fetchFuture(reqid); f == fut {
+			fut.SetError(err)
+			conn.markDone(fut)
 		} else if f != nil {
 			/* in theory, it is possible. In practice, you have
 			 * to have race condition that lasts hours */
@@ -742,45 +1057,72 @@ func (conn *Connection) putFuture(fut *Future, body func(*msgpack.Encoder) error
 				// packing error is more important than connection
 				// error, because it is indication of programmer's
 				// mistake.
-				fut.err = err
+				fut.SetError(err)
 			}
 		}
 		return
 	}
 	shard.bufmut.Unlock()
+
 	if firstWritten {
 		conn.dirtyShard <- shardn
 	}
+
+	if req.Async() {
+		if fut = conn.fetchFuture(reqid); fut != nil {
+			header := Header{
+				RequestId: reqid,
+				Error:     ErrorNo,
+			}
+			fut.SetResponse(header, nil)
+			conn.markDone(fut)
+		}
+	}
+}
+
+func (conn *Connection) markDone(fut *Future) {
+	if conn.rlimit != nil {
+		<-conn.rlimit
+	}
+	conn.decrementRequestCnt()
+}
+
+func (conn *Connection) peekFuture(reqid uint32) (fut *Future) {
+	shard := &conn.shard[reqid&(conn.opts.Concurrency-1)]
+	pos := (reqid / conn.opts.Concurrency) & (requestsMap - 1)
+	shard.rmut.Lock()
+	defer shard.rmut.Unlock()
+
+	if conn.opts.Timeout > 0 {
+		if fut = conn.getFutureImp(reqid, true); fut != nil {
+			pair := &shard.requests[pos]
+			*pair.last = fut
+			pair.last = &fut.next
+			fut.timeout = time.Since(epoch) + conn.opts.Timeout
+		}
+	} else {
+		fut = conn.getFutureImp(reqid, false)
+	}
+
+	return fut
 }
 
 func (conn *Connection) fetchFuture(reqid uint32) (fut *Future) {
 	shard := &conn.shard[reqid&(conn.opts.Concurrency-1)]
 	shard.rmut.Lock()
-	fut = conn.fetchFutureImp(reqid)
+	fut = conn.getFutureImp(reqid, true)
 	shard.rmut.Unlock()
 	return fut
 }
 
-func (conn *Connection) fetchFutureImp(reqid uint32) *Future {
+func (conn *Connection) getFutureImp(reqid uint32, fetch bool) *Future {
 	shard := &conn.shard[reqid&(conn.opts.Concurrency-1)]
 	pos := (reqid / conn.opts.Concurrency) & (requestsMap - 1)
-	pair := &shard.requests[pos]
-	root := &pair.first
-	for {
-		fut := *root
-		if fut == nil {
-			return nil
-		}
-		if fut.requestId == reqid {
-			*root = fut.next
-			if fut.next == nil {
-				pair.last = root
-			} else {
-				fut.next = nil
-			}
-			return fut
-		}
-		root = &fut.next
+	// futures with even requests id belong to requests list with nil context
+	if reqid%2 == 0 {
+		return shard.requests[pos].findFuture(reqid, fetch)
+	} else {
+		return shard.requestsWithCtx[pos].findFuture(reqid, fetch)
 	}
 }
 
@@ -795,9 +1137,9 @@ func (conn *Connection) timeouts() {
 			return
 		case <-t.C:
 		}
-		minNext := time.Now().Sub(epoch) + timeout
+		minNext := time.Since(epoch) + timeout
 		for i := range conn.shard {
-			nowepoch = time.Now().Sub(epoch)
+			nowepoch = time.Since(epoch)
 			shard := &conn.shard[i]
 			for pos := range shard.requests {
 				shard.rmut.Lock()
@@ -811,11 +1153,11 @@ func (conn *Connection) timeouts() {
 					} else {
 						fut.next = nil
 					}
-					fut.err = ClientError{
+					fut.SetError(ClientError{
 						Code: ErrTimeouted,
 						Msg:  fmt.Sprintf("client timeout for request %d", fut.requestId),
-					}
-					fut.markReady(conn)
+					})
+					conn.markDone(fut)
 					shard.bufmut.Unlock()
 				}
 				if pair.first != nil && pair.first.timeout < minNext {
@@ -824,7 +1166,7 @@ func (conn *Connection) timeouts() {
 				shard.rmut.Unlock()
 			}
 		}
-		nowepoch = time.Now().Sub(epoch)
+		nowepoch = time.Since(epoch)
 		if nowepoch+time.Microsecond < minNext {
 			t.Reset(minNext - nowepoch)
 		} else {
@@ -833,56 +1175,411 @@ func (conn *Connection) timeouts() {
 	}
 }
 
-func write(w io.Writer, data []byte) (err error) {
-	l, err := w.Write(data)
-	if err != nil {
-		return
-	}
-	if l != len(data) {
-		panic("Wrong length writed")
-	}
-	return
-}
+func read(r io.Reader, lenbuf []byte) (response []byte, err error) {
+	var length uint64
 
-func (conn *Connection) read(r io.Reader) (response []byte, err error) {
-	var length int
+	if _, err = io.ReadFull(r, lenbuf); err != nil {
+		return
+	}
+	if lenbuf[0] != 0xce {
+		err = errors.New("wrong response header")
+		return
+	}
+	length = (uint64(lenbuf[1]) << 24) +
+		(uint64(lenbuf[2]) << 16) +
+		(uint64(lenbuf[3]) << 8) +
+		uint64(lenbuf[4])
 
-	if _, err = io.ReadFull(r, conn.lenbuf[:]); err != nil {
+	switch {
+	case length == 0:
+		err = errors.New("response should not be 0 length")
+		return
+	case length > math.MaxUint32:
+		err = errors.New("response is too big")
 		return
 	}
-	if conn.lenbuf[0] != 0xce {
-		err = errors.New("Wrong reponse header")
-		return
-	}
-	length = (int(conn.lenbuf[1]) << 24) +
-		(int(conn.lenbuf[2]) << 16) +
-		(int(conn.lenbuf[3]) << 8) +
-		int(conn.lenbuf[4])
 
-	if length == 0 {
-		err = errors.New("Response should not be 0 length")
-		return
-	}
 	response = make([]byte, length)
 	_, err = io.ReadFull(r, response)
 
 	return
 }
 
-func (conn *Connection) nextRequestId() (requestId uint32) {
-	return atomic.AddUint32(&conn.requestId, 1)
+func (conn *Connection) nextRequestId(context bool) (requestId uint32) {
+	if context {
+		return atomic.AddUint32(&conn.contextRequestId, 2)
+	} else {
+		return atomic.AddUint32(&conn.requestId, 2)
+	}
 }
 
-// ConfiguredTimeout returns timeout from connection config
+// Do performs a request asynchronously on the connection.
+//
+// An error is returned if the request was formed incorrectly, or failed to
+// create the future.
+func (conn *Connection) Do(req Request) *Future {
+	if connectedReq, ok := req.(ConnectedRequest); ok {
+		if connectedReq.Conn() != conn {
+			fut := NewFuture(req)
+			fut.SetError(errUnknownRequest)
+			return fut
+		}
+	}
+	return conn.send(req, ignoreStreamId)
+}
+
+// ConfiguredTimeout returns a timeout from connection config.
 func (conn *Connection) ConfiguredTimeout() time.Duration {
 	return conn.opts.Timeout
 }
 
-// OverrideSchema sets Schema for the connection
-func (conn *Connection) OverrideSchema(s *Schema) {
-	if s != nil {
-		conn.mutex.Lock()
-		defer conn.mutex.Unlock()
-		conn.Schema = s
+// SetSchema sets Schema for the connection.
+func (conn *Connection) SetSchema(s Schema) {
+	sCopy := s.copy()
+	spaceAndIndexNamesSupported :=
+		isFeatureInSlice(iproto.IPROTO_FEATURE_SPACE_AND_INDEX_NAMES,
+			conn.serverProtocolInfo.Features)
+
+	conn.mutex.Lock()
+	defer conn.mutex.Unlock()
+	conn.lockShards()
+	defer conn.unlockShards()
+
+	conn.schemaResolver = &loadedSchemaResolver{
+		Schema:                      sCopy,
+		SpaceAndIndexNamesSupported: spaceAndIndexNamesSupported,
+	}
+}
+
+// NewPrepared passes a sql statement to Tarantool for preparation synchronously.
+func (conn *Connection) NewPrepared(expr string) (*Prepared, error) {
+	req := NewPrepareRequest(expr)
+	resp, err := conn.Do(req).GetResponse()
+	if err != nil {
+		return nil, err
+	}
+	return NewPreparedFromResponse(conn, resp)
+}
+
+// NewStream creates new Stream object for connection.
+//
+// Since v. 2.10.0, Tarantool supports streams and interactive transactions over them.
+// To use interactive transactions, memtx_use_mvcc_engine box option should be set to true.
+// Since 1.7.0
+func (conn *Connection) NewStream() (*Stream, error) {
+	next := atomic.AddUint64(&conn.lastStreamId, 1)
+	return &Stream{
+		Id:   next,
+		Conn: conn,
+	}, nil
+}
+
+// watchState is the current state of the watcher. See the idea at p. 70, 105:
+// https://drive.google.com/file/d/1nPdvhB0PutEJzdCq5ms6UI58dp50fcAN/view
+type watchState struct {
+	// value is a current value.
+	value interface{}
+	// version is a current version of the value.
+	version uint
+	// ack true if the acknowledge is already sent.
+	ack bool
+	// cnt is a count of active watchers for the key.
+	cnt int
+	// changed is a channel for broadcast the value changes.
+	changed chan struct{}
+	// unready channel exists if a state is not ready to work (subscription
+	// or unsubscription in progress).
+	unready chan struct{}
+}
+
+// initWatchEventVersion is an initial version until no events from Tarantool.
+const initWatchEventVersion uint = 0
+
+// connWatcher is an internal implementation of the Watcher interface.
+type connWatcher struct {
+	unregister sync.Once
+	// done is closed when the watcher is unregistered, but the watcher
+	// goroutine is not yet finished.
+	done chan struct{}
+	// finished is closed when the watcher is unregistered and the watcher
+	// goroutine is finished.
+	finished chan struct{}
+}
+
+// Unregister unregisters the connection watcher.
+func (w *connWatcher) Unregister() {
+	w.unregister.Do(func() {
+		close(w.done)
+	})
+	<-w.finished
+}
+
+// subscribeWatchChannel returns an existing one or a new watch state channel
+// for the key. It also increases a counter of active watchers for the channel.
+func subscribeWatchChannel(conn *Connection, key string) (chan watchState, error) {
+	var st chan watchState
+
+	for st == nil {
+		if val, ok := conn.watchMap.Load(key); !ok {
+			st = make(chan watchState, 1)
+			state := watchState{
+				value:   nil,
+				version: initWatchEventVersion,
+				ack:     false,
+				cnt:     0,
+				changed: nil,
+				unready: make(chan struct{}),
+			}
+			st <- state
+
+			if val, loaded := conn.watchMap.LoadOrStore(key, st); !loaded {
+				if _, err := conn.Do(newWatchRequest(key)).Get(); err != nil {
+					conn.watchMap.Delete(key)
+					close(state.unready)
+					return nil, err
+				}
+				// It is a successful subsctiption to a watch events by itself.
+				state = <-st
+				state.cnt = 1
+				close(state.unready)
+				state.unready = nil
+				st <- state
+				continue
+			} else {
+				close(state.unready)
+				close(st)
+				st = val.(chan watchState)
+			}
+		} else {
+			st = val.(chan watchState)
+		}
+
+		// It is an existing channel created outside. It may be in the
+		// unready state.
+		state := <-st
+		if state.unready == nil {
+			state.cnt += 1
+		}
+		st <- state
+
+		if state.unready != nil {
+			// Wait for an update and retry.
+			<-state.unready
+			st = nil
+		}
+	}
+
+	return st, nil
+}
+
+func isFeatureInSlice(expected iproto.Feature, actualSlice []iproto.Feature) bool {
+	for _, actual := range actualSlice {
+		if expected == actual {
+			return true
+		}
+	}
+	return false
+}
+
+// NewWatcher creates a new Watcher object for the connection.
+//
+// Server must support IPROTO_FEATURE_WATCHERS to use watchers.
+//
+// After watcher creation, the watcher callback is invoked for the first time.
+// In this case, the callback is triggered whether or not the key has already
+// been broadcast. All subsequent invocations are triggered with
+// box.broadcast() called on the remote host. If a watcher is subscribed for a
+// key that has not been broadcast yet, the callback is triggered only once,
+// after the registration of the watcher.
+//
+// The watcher callbacks are always invoked in a separate goroutine. A watcher
+// callback is never executed in parallel with itself, but they can be executed
+// in parallel to other watchers.
+//
+// If the key is updated while the watcher callback is running, the callback
+// will be invoked again with the latest value as soon as it returns.
+//
+// Watchers survive reconnection. All registered watchers are automatically
+// resubscribed when the connection is reestablished.
+//
+// Keep in mind that garbage collection of a watcher handle doesn’t lead to the
+// watcher’s destruction. In this case, the watcher remains registered. You
+// need to call Unregister() directly.
+//
+// Unregister() guarantees that there will be no the watcher's callback calls
+// after it, but Unregister() call from the callback leads to a deadlock.
+//
+// See:
+// https://www.tarantool.io/en/doc/latest/reference/reference_lua/box_events/#box-watchers
+//
+// Since 1.10.0
+func (conn *Connection) NewWatcher(key string, callback WatchCallback) (Watcher, error) {
+	// We need to check the feature because the IPROTO_WATCH request is
+	// asynchronous. We do not expect any response from a Tarantool instance
+	// That's why we can't just check the Tarantool response for an unsupported
+	// request error.
+	if !isFeatureInSlice(iproto.IPROTO_FEATURE_WATCHERS,
+		conn.c.ProtocolInfo().Features) {
+		err := fmt.Errorf("the feature %s must be supported by connection "+
+			"to create a watcher", iproto.IPROTO_FEATURE_WATCHERS)
+		return nil, err
+	}
+
+	return conn.newWatcherImpl(key, callback)
+}
+
+func (conn *Connection) newWatcherImpl(key string, callback WatchCallback) (Watcher, error) {
+	st, err := subscribeWatchChannel(conn, key)
+	if err != nil {
+		return nil, err
+	}
+
+	// Start the watcher goroutine.
+	done := make(chan struct{})
+	finished := make(chan struct{})
+
+	go func() {
+		version := initWatchEventVersion
+		for {
+			state := <-st
+			if state.changed == nil {
+				state.changed = make(chan struct{})
+			}
+			st <- state
+
+			if state.version != version {
+				callback(WatchEvent{
+					Conn:  conn,
+					Key:   key,
+					Value: state.value,
+				})
+				version = state.version
+
+				// Do we need to acknowledge the notification?
+				state = <-st
+				sendAck := !state.ack && version == state.version
+				if sendAck {
+					state.ack = true
+				}
+				st <- state
+
+				if sendAck {
+					// We expect a reconnect and re-subscribe if it fails to
+					// send the watch request. So it looks ok do not check a
+					// result. But we need to make sure that the re-watch
+					// request will not be finished by a small per-request
+					// timeout.
+					req := newWatchRequest(key).Context(context.Background())
+					conn.Do(req).Get()
+				}
+			}
+
+			select {
+			case <-done:
+				state := <-st
+				state.cnt -= 1
+				if state.cnt == 0 {
+					state.unready = make(chan struct{})
+				}
+				st <- state
+
+				if state.cnt == 0 {
+					// The last one sends IPROTO_UNWATCH.
+					if !conn.ClosedNow() {
+						// conn.ClosedNow() check is a workaround for calling
+						// Unregister from connectionClose().
+						//
+						// We need to make sure that the unwatch request will
+						// not be finished by a small per-request timeout to
+						// avoid lost of the request.
+						req := newUnwatchRequest(key).Context(context.Background())
+						conn.Do(req).Get()
+					}
+					conn.watchMap.Delete(key)
+					close(state.unready)
+				}
+
+				close(finished)
+				return
+			case <-state.changed:
+			}
+		}
+	}()
+
+	return &connWatcher{
+		done:     done,
+		finished: finished,
+	}, nil
+}
+
+// ProtocolInfo returns protocol version and protocol features
+// supported by connected Tarantool server. Beware that values might be
+// outdated if connection is in a disconnected state.
+// Since 2.0.0
+func (conn *Connection) ProtocolInfo() ProtocolInfo {
+	return conn.serverProtocolInfo.Clone()
+}
+
+func shutdownEventCallback(event WatchEvent) {
+	// Receives "true" on server shutdown.
+	// See https://www.tarantool.io/en/doc/latest/dev_guide/internals/iproto/graceful_shutdown/
+	// step 2.
+	val, ok := event.Value.(bool)
+	if ok && val {
+		go event.Conn.shutdown(false)
+	}
+}
+
+func (conn *Connection) shutdown(forever bool) error {
+	// Forbid state changes.
+	conn.mutex.Lock()
+	defer conn.mutex.Unlock()
+
+	if !atomic.CompareAndSwapUint32(&conn.state, connConnected, connShutdown) {
+		if forever {
+			err := ClientError{ErrConnectionClosed, "connection closed by client"}
+			return conn.closeConnection(err, true)
+		}
+		return nil
+	}
+
+	if forever {
+		// We don't want to reconnect any more.
+		conn.opts.Reconnect = 0
+		conn.opts.MaxReconnects = 0
+	}
+
+	conn.cond.Broadcast()
+	conn.notify(Shutdown)
+
+	c := conn.c
+	for {
+		if (atomic.LoadUint32(&conn.state) != connShutdown) || (c != conn.c) {
+			return nil
+		}
+		if atomic.LoadInt64(&conn.requestCnt) == 0 {
+			break
+		}
+		// Use cond var on conn.mutex since request execution may
+		// call reconnect(). It is ok if state changes as part of
+		// reconnect since Tarantool server won't allow to reconnect
+		// in the middle of shutting down.
+		conn.cond.Wait()
+	}
+
+	if forever {
+		err := ClientError{ErrConnectionClosed, "connection closed by client"}
+		return conn.closeConnection(err, true)
+	} else {
+		// Start to reconnect based on common rules, same as in net.box.
+		// Reconnect also closes the connection: server waits until all
+		// subscribed connections are terminated.
+		// See https://www.tarantool.io/en/doc/latest/dev_guide/internals/iproto/graceful_shutdown/
+		// step 3.
+		conn.reconnectImpl(ClientError{
+			ErrConnectionClosed,
+			"connection closed after server shutdown",
+		}, conn.c)
+		return nil
 	}
 }

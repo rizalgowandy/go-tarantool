@@ -2,20 +2,32 @@ package uuid_test
 
 import (
 	"fmt"
+	"log"
+	"os"
 	"testing"
 	"time"
 
-	. "github.com/tarantool/go-tarantool"
-	_ "github.com/tarantool/go-tarantool/uuid" 
-	"gopkg.in/vmihailenco/msgpack.v2"
 	"github.com/google/uuid"
+	"github.com/vmihailenco/msgpack/v5"
+
+	. "github.com/tarantool/go-tarantool/v2"
+	"github.com/tarantool/go-tarantool/v2/test_helpers"
+	_ "github.com/tarantool/go-tarantool/v2/uuid"
 )
+
+// There is no way to skip tests in testing.M,
+// so we use this variable to pass info
+// to each testing.T that it should skip.
+var isUUIDSupported = false
 
 var server = "127.0.0.1:3013"
 var opts = Opts{
-	Timeout: 500 * time.Millisecond,
-	User:    "test",
-	Pass:    "test",
+	Timeout: 5 * time.Second,
+}
+var dialer = NetDialer{
+	Address:  server,
+	User:     "test",
+	Password: "test",
 }
 
 var space = "testUUID"
@@ -28,7 +40,7 @@ type TupleUUID struct {
 func (t *TupleUUID) DecodeMsgpack(d *msgpack.Decoder) error {
 	var err error
 	var l int
-	if l, err = d.DecodeSliceLen(); err != nil {
+	if l, err = d.DecodeArrayLen(); err != nil {
 		return err
 	}
 	if l != 1 {
@@ -42,37 +54,9 @@ func (t *TupleUUID) DecodeMsgpack(d *msgpack.Decoder) error {
 	return nil
 }
 
-func connectWithValidation(t *testing.T) *Connection {
-	conn, err := Connect(server, opts)
-	if err != nil {
-		t.Errorf("Failed to connect: %s", err.Error())
-	}
-	if conn == nil {
-		t.Errorf("conn is nil after Connect")
-	}
-	return conn
-}
-
-func skipIfUUIDUnsupported(t *testing.T, conn *Connection) {
-	resp, err := conn.Eval("return pcall(require('msgpack').encode, require('uuid').new())", []interface{}{})
-	if err != nil {
-		t.Errorf("Failed to Eval: %s", err.Error())
-	}
-	if resp == nil {
-		t.Errorf("Response is nil after Eval")
-	}
-	if len(resp.Data) < 1 {
-		t.Errorf("Response.Data is empty after Eval")
-	}
-	val := resp.Data[0].(bool)
-	if val != true {
-		t.Skip("Skipping test for Tarantool without UUID support in msgpack")
-	}
-}
-
 func tupleValueIsId(t *testing.T, tuples []interface{}, id uuid.UUID) {
 	if len(tuples) != 1 {
-		t.Errorf("Response Data len != 1")
+		t.Fatalf("Response Data len != 1")
 	}
 
 	if tpl, ok := tuples[0].([]interface{}); !ok {
@@ -88,29 +72,33 @@ func tupleValueIsId(t *testing.T, tuples []interface{}, id uuid.UUID) {
 }
 
 func TestSelect(t *testing.T) {
-	conn := connectWithValidation(t)
-	defer conn.Close()
+	if isUUIDSupported == false {
+		t.Skip("Skipping test for Tarantool without UUID support in msgpack")
+	}
 
-	skipIfUUIDUnsupported(t, conn)
+	conn := test_helpers.ConnectWithValidation(t, dialer, opts)
+	defer conn.Close()
 
 	id, uuidErr := uuid.Parse("c8f0fa1f-da29-438c-a040-393f1126ad39")
 	if uuidErr != nil {
-		t.Errorf("Failed to prepare test uuid: %s", uuidErr)
+		t.Fatalf("Failed to prepare test uuid: %s", uuidErr)
 	}
 
-	resp, errSel := conn.Select(space, index, 0, 1, IterEq, []interface{}{ id })
+	sel := NewSelectRequest(space).
+		Index(index).
+		Limit(1).
+		Iterator(IterEq).
+		Key([]interface{}{id})
+	data, errSel := conn.Do(sel).Get()
 	if errSel != nil {
-		t.Errorf("UUID select failed: %s", errSel.Error())
+		t.Fatalf("UUID select failed: %s", errSel.Error())
 	}
-	if resp == nil {
-		t.Errorf("Response is nil after Select")
-	}
-	tupleValueIsId(t, resp.Data, id)
+	tupleValueIsId(t, data, id)
 
 	var tuples []TupleUUID
-	errTyp := conn.SelectTyped(space, index, 0, 1, IterEq, []interface{}{ id }, &tuples)
+	errTyp := conn.Do(sel).GetTyped(&tuples)
 	if errTyp != nil {
-		t.Errorf("Failed to SelectTyped: %s", errTyp.Error())
+		t.Fatalf("Failed to SelectTyped: %s", errTyp.Error())
 	}
 	if len(tuples) != 1 {
 		t.Errorf("Result len of SelectTyped != 1")
@@ -121,31 +109,75 @@ func TestSelect(t *testing.T) {
 }
 
 func TestReplace(t *testing.T) {
-	conn := connectWithValidation(t)
-	defer conn.Close()
+	if isUUIDSupported == false {
+		t.Skip("Skipping test for Tarantool without UUID support in msgpack")
+	}
 
-	skipIfUUIDUnsupported(t, conn)
+	conn := test_helpers.ConnectWithValidation(t, dialer, opts)
+	defer conn.Close()
 
 	id, uuidErr := uuid.Parse("64d22e4d-ac92-4a23-899a-e59f34af5479")
 	if uuidErr != nil {
 		t.Errorf("Failed to prepare test uuid: %s", uuidErr)
 	}
 
-	respRep, errRep := conn.Replace(space, []interface{}{ id })
+	rep := NewReplaceRequest(space).Tuple([]interface{}{id})
+	dataRep, errRep := conn.Do(rep).Get()
 	if errRep != nil {
 		t.Errorf("UUID replace failed: %s", errRep)
 	}
-	if respRep == nil {
-		t.Errorf("Response is nil after Replace")
-	}
-	tupleValueIsId(t, respRep.Data, id)
+	tupleValueIsId(t, dataRep, id)
 
-	respSel, errSel := conn.Select(space, index, 0, 1, IterEq, []interface{}{ id })
+	sel := NewSelectRequest(space).
+		Index(index).
+		Limit(1).
+		Iterator(IterEq).
+		Key([]interface{}{id})
+	dataSel, errSel := conn.Do(sel).Get()
 	if errSel != nil {
 		t.Errorf("UUID select failed: %s", errSel)
 	}
-	if respSel == nil {
-		t.Errorf("Response is nil after Select")
+	tupleValueIsId(t, dataSel, id)
+}
+
+// runTestMain is a body of TestMain function
+// (see https://pkg.go.dev/testing#hdr-Main).
+// Using defer + os.Exit is not works so TestMain body
+// is a separate function, see
+// https://stackoverflow.com/questions/27629380/how-to-exit-a-go-program-honoring-deferred-calls
+func runTestMain(m *testing.M) int {
+	isLess, err := test_helpers.IsTarantoolVersionLess(2, 4, 1)
+	if err != nil {
+		log.Fatalf("Failed to extract tarantool version: %s", err)
 	}
-	tupleValueIsId(t, respSel.Data, id)
+
+	if isLess {
+		log.Println("Skipping UUID tests...")
+		isUUIDSupported = false
+		return m.Run()
+	} else {
+		isUUIDSupported = true
+	}
+
+	inst, err := test_helpers.StartTarantool(test_helpers.StartOpts{
+		Dialer:       dialer,
+		InitScript:   "config.lua",
+		Listen:       server,
+		WaitStart:    100 * time.Millisecond,
+		ConnectRetry: 10,
+		RetryTimeout: 500 * time.Millisecond,
+	})
+	defer test_helpers.StopTarantoolWithCleanup(inst)
+
+	if err != nil {
+		log.Printf("Failed to prepare test tarantool: %s", err)
+		return 1
+	}
+
+	return m.Run()
+}
+
+func TestMain(m *testing.M) {
+	code := runTestMain(m)
+	os.Exit(code)
 }
