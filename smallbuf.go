@@ -34,7 +34,7 @@ func (s *smallBuf) ReadByte() (b byte, err error) {
 
 func (s *smallBuf) UnreadByte() error {
 	if s.p == 0 {
-		return errors.New("Could not unread")
+		return errors.New("could not unread")
 	}
 	s.p--
 	return nil
@@ -51,10 +51,25 @@ func (s *smallBuf) Bytes() []byte {
 	return nil
 }
 
+func (s *smallBuf) Offset() int {
+	return s.p
+}
+
+func (s *smallBuf) Seek(offset int) error {
+	if offset < 0 {
+		return errors.New("too small offset")
+	}
+	if offset > len(s.b) {
+		return errors.New("too big offset")
+	}
+	s.p = offset
+	return nil
+}
+
 type smallWBuf struct {
-	b []byte
+	b   []byte
 	sum uint
-	n uint
+	n   uint
 }
 
 func (s *smallWBuf) Write(b []byte) (int, error) {
@@ -85,11 +100,11 @@ func (s *smallWBuf) Trunc(n int) {
 }
 
 func (s *smallWBuf) Reset() {
-	s.sum = uint(uint64(s.sum) * 15 / 16) + uint(len(s.b))
+	s.sum = uint(uint64(s.sum)*15/16) + uint(len(s.b))
 	if s.n < 16 {
 		s.n++
 	}
-	if cap(s.b) > 1024 && s.sum / s.n < uint(cap(s.b))/4 {
+	if cap(s.b) > 1024 && s.sum/s.n < uint(cap(s.b))/4 {
 		s.b = make([]byte, 0, s.sum/s.n)
 	} else {
 		s.b = s.b[:0]

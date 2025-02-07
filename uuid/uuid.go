@@ -1,3 +1,19 @@
+// Package with support of Tarantool's UUID data type.
+//
+// UUID data type supported in Tarantool since 2.4.1.
+//
+// Since: 1.6.0.
+//
+// # See also
+//
+//   - Tarantool commit with UUID support:
+//     https://github.com/tarantool/tarantool/commit/d68fc29246714eee505bc9bbcd84a02de17972c5
+//
+//   - Tarantool data model:
+//     https://www.tarantool.io/en/doc/latest/book/box/data_model/
+//
+//   - Module UUID:
+//     https://www.tarantool.io/en/doc/latest/reference/reference_lua/uuid/
 package uuid
 
 import (
@@ -5,14 +21,11 @@ import (
 	"reflect"
 
 	"github.com/google/uuid"
-	"gopkg.in/vmihailenco/msgpack.v2"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
-// UUID external type
-// Supported since Tarantool 2.4.1. See more in commit messages.
-// https://github.com/tarantool/tarantool/commit/d68fc29246714eee505bc9bbcd84a02de17972c5
-
-const UUID_extId = 2
+// UUID external type.
+const uuid_extID = 2
 
 func encodeUUID(e *msgpack.Encoder, v reflect.Value) error {
 	id := v.Interface().(uuid.UUID)
@@ -24,14 +37,14 @@ func encodeUUID(e *msgpack.Encoder, v reflect.Value) error {
 
 	_, err = e.Writer().Write(bytes)
 	if err != nil {
-		return fmt.Errorf("msgpack: can't write bytes to encoder writer: %w", err)
+		return fmt.Errorf("msgpack: can't write bytes to msgpack.Encoder writer: %w", err)
 	}
 
 	return nil
 }
 
 func decodeUUID(d *msgpack.Decoder, v reflect.Value) error {
-	var bytesCount int = 16;
+	var bytesCount = 16
 	bytes := make([]byte, bytesCount)
 
 	n, err := d.Buffered().Read(bytes)
@@ -53,5 +66,13 @@ func decodeUUID(d *msgpack.Decoder, v reflect.Value) error {
 
 func init() {
 	msgpack.Register(reflect.TypeOf((*uuid.UUID)(nil)).Elem(), encodeUUID, decodeUUID)
-	msgpack.RegisterExt(UUID_extId, (*uuid.UUID)(nil))
+	msgpack.RegisterExtEncoder(uuid_extID, uuid.UUID{},
+		func(e *msgpack.Encoder, v reflect.Value) ([]byte, error) {
+			uuid := v.Interface().(uuid.UUID)
+			return uuid.MarshalBinary()
+		})
+	msgpack.RegisterExtDecoder(uuid_extID, uuid.UUID{},
+		func(d *msgpack.Decoder, v reflect.Value, extLen int) error {
+			return decodeUUID(d, v)
+		})
 }
